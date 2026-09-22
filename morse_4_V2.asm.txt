@@ -1,0 +1,177 @@
+#########################################################################
+# TABELLA DI ALLOCAZIONE DEI REGISTRI 
+#
+# REGISTRO | TIPO      | FUNZIONE SPECIFICA
+# ---------|-----------|-------------------------------------------------
+# $s0      | Reserved  | Costante di timeout: numero di bit a 0 consecutivi (4)
+# $s1      | Reserved  | Contatore della durata dell'impulso alto (bit a 1)
+# $s2      | Reserved  | Puntatore corrente al byte del segnale
+# $s3      | Reserved  | Accumulatore geometrico Morse (inizializzato con Start Bit = 1)
+# $s4      | Reserved  | Registro di transito: memorizza il byte estratto
+# $s5      | Reserved  | Maschera di scansione bit-a-bit (da 128 a 0 tramite srl)
+# $s6      | Reserved  | Registro flag per il risultato dell'operazione di AND
+# $t3      | Temporary | Indirizzo base del vettore dizionario (Lookup Table ASCII)
+# $t4      | Temporary | Registro di calcolo aritmetico per offset e costanti
+# $t9      | Temporary | Contatore del silenzio corrente (bit a 0 consecutivi)
+# $a0      | Argomento | Registro per il passaggio del carattere alla syscall 11
+# $v0      | Risultato | Registro di sistema per la selezione del servizio syscall
+#$t5       |Temporary  | Registro utilizzato per contenere il valore massimo che può raggiungere $s3
+
+#########################################################################
+#nella tabella il numero massimo raggiunto è 29, quindi verifico che l'offset calcolato non sia maggiore di quel numero
+.data
+    segnale_byte: .byte 0x5D, 0x00
+    inizio_dizionario: 
+        .byte 0x00,0x00
+        .ascii "ETIANMSURWDKGOHVF L"          
+        .ascii "\n"  # RICORDO: Valore del carattere spazio e newline sono arbitrari
+        .ascii "PJBXCYZQ"
+        
+
+    err1: .asciiz "Il segnale inserito ha un errore del tipo: Il registro $s3 supera la sua dinamica massima\n"
+    err2: .asciiz "Il segnale inserito non rispetta la convenzione 1 per punto e 111 per linea\n" 
+.text
+.globl main
+.globl __start
+__start:
+main:
+    # --- Inizializzazione delle costanti e dello stato iniziale ---
+    li   $s3, 1                     # Assegna il primo bit a 1 all'accumulatore per preservare gli zeri in testa
+    la   $t3, inizio_dizionario     # Carica l'indirizzo base della Lookup Table per la decodifica 
+    li   $t5, 29                    #numero massimo raggiunto dal vettore $s3
+    
+    li   $s0, 4                     # Sottomisura di timeout: 4 bit a zero indicano la fine della lettera
+    li   $s1, 0                     # Inizializza a zero il contatore della larghezza d'impulso (bit alti)
+    li   $t9, 0                     # Inizializza a zero il contatore del silenzio continuo (bit bassi)
+
+    la   $s2, segnale_byte          # Inizializza il puntatore di lettura alla sorgente dati
+
+nuovo_byte: 
+    lbu  $s4, 0($s2)                # Carica un singolo byte senza segno dal vettore del segnale
+    beq  $s4, $zero, fine_messaggio # Se il byte estratto e' zero, avvia la chiusura del flusso
+    li   $s5, 128                   # Imposta la maschera di scansione sul bit MSB (10000000 binario)
+
+ciclo:
+    beq  $s5, $zero, leggi_nuovo_byte # Se lo shift sposta l'1 fuori dalla maschera, passa al byte successivo
+    
+    and  $s6, $s4, $s5              # Verifica lo stato del bit corrente tramite mascheramento logico
+    srl  $s5, $s5, 1                # Esegue lo shift a destra della maschera per la prossima iterazione
+    
+    bne  $s6, $zero, letto_uno      # Se l'esito dell'AND non e zero, salta alla gestione del bit alto
+
+letto_zero:
+    addi $t9, $t9, 1                # Incrementa il contatore delle letture consecutive a zero
+    beq  $s1, $zero, controlla_fine_lettera # Se non vi era un impulso precedentemente attivo, verifica il timeout
+
+    # Gestione del fronte di discesa (transizione da 1 a 0): analizza la durata dell'impulso terminato
+
+    li   $t4, 1
+    beq  $s1, $t4, letto_corto      # Se l'impulso ha durata pari a 1 ciclo, viene riconosciuto un punto
+    li   $t4, 3
+    beq  $s1, $t4, letto_lungo      # Se l'impulso ha durata pari a 3 cicli, viene riconosciuta una linea
+    
+    la $a0, err2                    # in caso di anomalie rispetto al non corretto utilizzo della convenvizone
+    li $v0, 4                       #stampo un messaggio di errore e poi chiudo il programma
+    syscall
+    li $v0,10
+    syscall 
+
+controlla_fine_lettera:
+    bne  $t9, $s0, ciclo            # Se il silenzio corrente e inferiore alla soglia, riprende la scansione
+    li   $t4, 1
+    bgt  $s3, $t4, stampa_lettera   #  SE l'accumulatore è vuoto (<= 1), non c'è nulla da stampare: torna al ciclo
+                                    # Altrimenti stampa 
+                                    #Questa bgt serve a garnatire che si stampi solo quando si è letti effettivamente punti e linee
+    j    ciclo
+
+superato_limite:
+    la $a0, err1
+    li $v0, 4
+    syscall
+    li $v0,10
+    syscall 
+
+letto_uno:
+    li   $t9, 0                     # Reset immediato del contatore del silenzio sul fronte di salita
+    addi $s1, $s1, 1                # Incrementa la durata dell'impulso attivo corrente
+    j    ciclo
+
+letto_corto:
+    sll  $s3, $s3, 1                # Shift a sinistra dell'accumulatore per inserire un bit a 0 (Punto)
+    li   $s1, 0                     # Ripristina il contatore di impulsi alti
+    j    ciclo
+
+letto_lungo:
+    sll  $s3, $s3, 1                # Shift a sinistra dell'accumulatore
+    ori  $s3, $s3, 1                # Forza il bit meno significativo a 1 tramite OR immediato (Linea)
+    li   $s1, 0                     # Ripristina il contatore di impulsi alti
+    j    ciclo
+
+stampa_lettera:
+    bgt  $s3,$t5, superato_limite   #controllo se il valore raggiunto da $s3 e' valido o meno 
+
+    # Calcolo dell'indirizzo di memoria effettivo tramite offset geometrico
+    addu $t4, $t3, $s3              # Indirizzo finale = Base del dizionario ($t3) + Offset calcolato ($s3)
+    lbu  $a0, 0($t4)                # Carica il codice ASCII memorizzato nella cella risultante
+    
+    li   $v0, 11                    # Carica il codice della syscall 11 per la stampa di un carattere
+    syscall
+
+reset_per_prossima:                 #DOPO LA STAMPA RESETTO I VALORI DI ACCUMULATORE CONTATORE DI ZERI E DI UNI
+    li   $s3, 1                     # Ripristina l'accumulatore al valore dello Start Bit iniziale
+    li   $t9, 0                     # Azzera il registro del silenzio in vista della nuova lettera
+    li   $s1, 0
+    j    ciclo
+
+leggi_nuovo_byte:
+    addiu $s2, $s2, 1               # Incrementa il puntatore di lettura per passare al byte successivo
+    j     nuovo_byte
+
+
+fine_messaggio:
+#ARRIVARE A FINE MESSAGGIO SIGNIFICA CHE HO LETTO UN BYTE TUTTO A ZERO, MA POTREBBERO CAPITARE 2 COSE FACENDO QUESTO PASSAGGIO:
+#1) L'ACCUMULATORE $s3 NON E' STATO SVUOTATO (SI SVUOTA SOLO QUANDO HO 4 ZERI DI FILA)
+#2) IL REGISTRO $s1 CONTENEVA UN VALORE SIGNIFICATIVO CHE NON E' STATO ANALIZZATO (LUNGO O CORTO)
+#PRIMA DI TERMINARE IL PROGRAMMA DEVO CONTROLLARE E AGIRE DI CONSEGUENZA NELL'EVENIENZA DI QUESTI CASI
+
+
+# (ciò avviene in una condizione particolare del tipo: 01011101|00000000, sarebbe: 0x5D, 0x00)
+
+    beq  $s1, $zero, verifico_s3_vuoto    # Se $s1 è 0, salta direttamente alla verifica dell'accumulatore
+
+    # SE $s1 non è zero, verifico se rispetta la convenzione (1 per punto o 3 per linea)
+    li   $t4, 1
+    beq  $s1, $t4, fine_corto             # Se dura 1 ciclo, è un punto valido
+    li   $t4, 3
+    beq  $s1, $t4, fine_lungo             # Se dura 3 cicli, è una linea valida
+    
+    # Se non è né 1 né 3, l'ultimo impulso viola la convenzione! Salto all'errore
+    la   $a0, err2
+    li   $v0, 4
+    syscall
+    li   $v0, 10
+    syscall
+
+fine_corto:
+    sll  $s3, $s3, 1                      # Inserisce il punto (shift a sinistra di uno zero)
+    j    verifico_s3_vuoto                # Evita la caduta verticale, salta alla stampa
+
+fine_lungo:
+    sll  $s3, $s3, 1                      # Shift a sinistra dell'accumulatore
+    ori  $s3, $s3, 1                      # Forza il bit meno significativo a 1 (Linea)
+    # Lasciamo cadere verticalmente su verifico_s3_vuoto perché è l'istruzione successiva
+
+verifico_s3_vuoto:
+    li   $t4, 1
+    ble  $s3, $t4, esci                   # Se non ci sono dati residui, esci subito
+    
+    # Se ci sono dati residui, li stampo qui e poi chiudo
+    bgt  $s3, $t5, superato_limite 
+    addu $t4, $t3, $s3 
+    lbu  $a0, 0($t4) 
+    li   $v0, 11 
+    syscall                               # Stampa l'ultimo carattere completo
+
+esci:
+    li   $v0, 10                          # Configura la syscall 10 per la terminazione corretta
+    syscall
